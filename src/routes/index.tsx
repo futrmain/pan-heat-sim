@@ -112,6 +112,7 @@ function Index() {
           heaterRadius: Math.min(heater.diameter / 2, pan.diameter / 2),
           heaterThickness: heater.thickness,
           heaterPower: heater.power,
+          heaterType: heater.type ?? "flux",
           setpointHigh: heater.setpointHigh + 273.15,
           setpointLow: heater.setpointLow + 273.15,
           ambient: ambient + 273.15,

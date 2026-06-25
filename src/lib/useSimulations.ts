@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import SimWorker from "./sim.worker?worker";
-import { type SimState, type Layer } from "./simulation";
+import { type SimState, type Layer, type HeaterType } from "./simulation";
 
 export interface SimInput {
   key: string;
@@ -11,6 +11,7 @@ export interface SimInput {
   heaterRadius: number;
   heaterThickness: number;
   heaterPower: number;
+  heaterType: HeaterType;
   setpointHigh: number;
   setpointLow: number;
   ambient: number;

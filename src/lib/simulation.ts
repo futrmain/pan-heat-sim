@@ -75,6 +75,12 @@ export interface Layer {
   basePlate?: boolean;
 }
 
+// Heater type. "flux" (default) is the simple bottom-surface heat-flux model.
+// "induction" keeps that same pan-bottom flux but additionally simulates the
+// cooktop's glass-ceramic plate beneath the pan and drives the hysteresis off
+// a sensor at the centre of the glass bottom face (see the glass block below).
+export type HeaterType = "flux" | "induction";
+
 export interface SimParams {
   panRadius: number; // m — cooking-surface radius (heater stays inside this)
   rimHeight: number; // m — radial rim past the cooking edge (flat flange exposed to air on both sides)
@@ -83,6 +89,7 @@ export interface SimParams {
   heaterRadius: number; // m — mean radius of the heater ring
   heaterThickness: number; // m — radial band width of the heater ring
   heaterPower: number; // W
+  heaterType?: HeaterType; // "flux" (default) or "induction" (adds the glass plate)
   setpointHigh: number; // K — heater turns OFF when center top-surface T ≥ this
   setpointLow: number; // K — heater turns ON when center top-surface T ≤ this
   ambient: number; // K
@@ -197,6 +204,37 @@ export interface SimState {
   TnSteakTopBuf: Float64Array; // T_n at steak top row
   hSteakSideBuf: Float64Array; // length steakNz — outer-side face Robin (i = steakNr-1)
   TnSteakSideBuf: Float64Array; // T_n at steak outer-side column
+  // Induction glass-ceramic plate (only built when params.heaterType ===
+  // "induction"). A second axisymmetric body beneath the pan, coupled through
+  // a contact face at z = 0 (the pan bottom) for cells under the cooking
+  // footprint. Bottom face adiabatic; top face = pan contact (i < nInner) or
+  // air (i ≥ nInner); outer rim = air. Layout idx = k*glassNr + i (k axial,
+  // 0 = bottom, glassNz-1 = top; i radial). The hysteresis sensor reads the
+  // glass bottom-centre cell (k = 0, i = 0).
+  glassActive: boolean; // true when the heater is an induction type
+  glassNr: number; // radial cells (= nInner pan-matched cells + outer extension to GLASS_RADIUS)
+  glassNz: number; // axial cells through the glass
+  Tglass: Float64Array; // length glassNr*glassNz
+  TglassStar: Float64Array; // ADI scratch
+  dzGlass: number; // m — axial cell width
+  ringAreaGlass: Float64Array; // length glassNr — top/bottom face area per radial cell
+  rGlassLeft: Float64Array; // length glassNr
+  rGlassRight: Float64Array; // length glassNr
+  drGlassFace: Float64Array; // length glassNr — center-to-center distance (drGlassFace[0] unused)
+  kGlass: number;
+  rhoGlass: number;
+  cpGlassK: number;
+  epsGlass: number;
+  glassInitialTempK: number; // reference for E_stored_glass
+  // Pan(bottom) ↔ glass(top) contact conductance per radial cell (W/K). Only
+  // non-zero for i < nInner; = GLASS_CONTACT_CONDUCTANCE · ringArea[i].
+  gGlassContact: Float64Array; // length glassNr (zero outside the cooking footprint)
+  TnPanBotBuf: Float64Array; // length Nr — T_n at pan bottom row (j = 0), snapshot for the contact source
+  // Glass air-loss scratch (top face beyond the footprint + outer side).
+  hGlassTopBuf: Float64Array; // length glassNr — top face Robin coef W/K (k = glassNz-1; 0 under the pan)
+  TnGlassTopBuf: Float64Array; // T_n at glass top row
+  hGlassSideBuf: Float64Array; // length glassNz — outer-side face Robin (i = glassNr-1)
+  TnGlassSideBuf: Float64Array; // T_n at glass outer-side column
   // ADI scratch buffers
   Tstar: Float64Array; // length Nr*Nz — intermediate field after half-step 1
   hTopBuf: Float64Array; // length Nr — H_top[i] = (h_conv + hRad(T_n))·ringArea[i]
@@ -259,6 +297,19 @@ export const SEARING_TEMP_K = 200 + 273.15;
 // face has seared and the centre is still cool — a typical home-cook flip
 // trigger.
 export const STEAK_FLIP_TEMP_K = 25 + 273.15;
+
+// ---- Induction glass-ceramic plate (only built when heaterType === "induction").
+// Modelled as a second axisymmetric body beneath the pan, kept deliberately
+// simple: a flat disc of fixed radius/thickness/material. Its top face touches
+// the pan base over the cooking footprint (finite contact conductance) and
+// loses heat to air everywhere outside it; its bottom face is adiabatic; its
+// outer rim loses heat to air. The hysteresis sensor sits at the centre of the
+// glass bottom face. These are module constants (not user params) to keep the
+// plumbing minimal — only the heater *type* travels through SimParams.
+export const GLASS_RADIUS = 0.5; // m
+export const GLASS_THICKNESS = 0.004; // m — typical induction cooktop glass
+export const GLASS_NZ = 4; // axial cells through the glass
+export const GLASS_CONTACT_CONDUCTANCE = 500; // W/m²·K — imperfect glass↔metal contact
 
 export function initSim(params: SimParams): SimState {
   const { layers, panRadius, heaterRadius, heaterPower, initialTemp } = params;
@@ -451,7 +502,70 @@ export function initSim(params: SimParams): SimState {
       gContactPerCell[i] = ringAreaSteak[i] / Rface;
     }
   }
-  const tdMax = Math.max(Nr, Nz, steakNz);
+
+  // ---- Induction glass-ceramic plate ----------------------------------
+  // Built only for induction heaters. The inner radial cells (i < nInner)
+  // reuse the pan's cooking-zone cell edges exactly so the pan-bottom ↔
+  // glass-top contact is a clean 1:1 face match (same trick the steak uses
+  // at the cooking surface). Beyond panRadius the glass extends with ~uniform
+  // Δr cells out to GLASS_RADIUS.
+  const glassActive = (params.heaterType ?? "flux") === "induction";
+  const glassNz = glassActive ? Math.max(1, Math.floor(GLASS_NZ)) : 0;
+  const dzGlass = glassNz > 0 ? GLASS_THICKNESS / glassNz : 0;
+  const glassMat = MATERIALS.Glass;
+  const glassExtent = Math.max(0, GLASS_RADIUS - panRadius);
+  const nGlassExtra =
+    glassActive && glassExtent > 0
+      ? Math.max(1, Math.round(glassExtent / Math.max(drTarget, 1e-12)))
+      : 0;
+  const drGlassExtra = nGlassExtra > 0 ? glassExtent / nGlassExtra : 0;
+  const glassNr = glassActive ? nInner + nGlassExtra : 0;
+  const Tglass = new Float64Array(glassNr * glassNz);
+  Tglass.fill(initialTemp);
+  const TglassStar = new Float64Array(glassNr * glassNz);
+  const ringAreaGlass = new Float64Array(glassNr);
+  const rGlassLeft = new Float64Array(glassNr);
+  const rGlassRight = new Float64Array(glassNr);
+  const drGlassFace = new Float64Array(glassNr);
+  const gGlassContact = new Float64Array(glassNr);
+  if (glassActive && glassNr > 0) {
+    // Contact resistance per unit area (m²K/W): the finite interface term
+    // 1/h_c in series with the half-cell conduction of the pan-bottom layer
+    // and the glass-top layer. The interface term dominates for realistic h_c.
+    const kPanBot = k[0];
+    const Rcontact =
+      1 / GLASS_CONTACT_CONDUCTANCE + dz[0] / (2 * kPanBot) + dzGlass / (2 * glassMat.k);
+    for (let i = 0; i < glassNr; i++) {
+      if (i < nInner) {
+        // Reuse the pan cooking-zone cell edges/areas verbatim.
+        rGlassLeft[i] = rLeft[i];
+        rGlassRight[i] = rRight[i];
+        ringAreaGlass[i] = ringArea[i];
+        gGlassContact[i] = ringArea[i] / Rcontact;
+      } else {
+        const j = i - nInner;
+        const rl = panRadius + j * drGlassExtra;
+        const rr = panRadius + (j + 1) * drGlassExtra;
+        rGlassLeft[i] = rl;
+        rGlassRight[i] = rr;
+        ringAreaGlass[i] = Math.PI * (rr * rr - rl * rl);
+        gGlassContact[i] = 0; // no pan above → air, not contact
+      }
+    }
+    // Snap edges to exact boundaries (avoid FP drift).
+    if (nInner > 0) rGlassRight[nInner - 1] = panRadius;
+    if (nGlassExtra > 0) rGlassLeft[nInner] = panRadius;
+    rGlassRight[glassNr - 1] = GLASS_RADIUS;
+    // Center-to-center distances (for radial conduction; the mesh is
+    // non-uniform across the panRadius boundary so this is per-face).
+    for (let i = 1; i < glassNr; i++) {
+      const ci = 0.5 * (rGlassLeft[i] + rGlassRight[i]);
+      const cim1 = 0.5 * (rGlassLeft[i - 1] + rGlassRight[i - 1]);
+      drGlassFace[i] = ci - cim1;
+    }
+  }
+
+  const tdMax = Math.max(Nr, Nz, steakNz, glassNr, glassNz);
 
   // Per-cell Fourier numbers. Pure diffusion has no advective CFL; Fo gates
   // CN accuracy and ringing tendency, not stability. Use min Δr (across the
@@ -533,6 +647,27 @@ export function initSim(params: SimParams): SimState {
     TnSteakTopBuf: new Float64Array(steakNr),
     hSteakSideBuf: new Float64Array(steakNz),
     TnSteakSideBuf: new Float64Array(steakNz),
+    glassActive,
+    glassNr,
+    glassNz,
+    Tglass,
+    TglassStar,
+    dzGlass,
+    ringAreaGlass,
+    rGlassLeft,
+    rGlassRight,
+    drGlassFace,
+    kGlass: glassMat.k,
+    rhoGlass: glassMat.rho,
+    cpGlassK: glassMat.cp,
+    epsGlass: glassMat.emissivity,
+    glassInitialTempK: initialTemp,
+    gGlassContact,
+    TnPanBotBuf: new Float64Array(Nr),
+    hGlassTopBuf: new Float64Array(glassNr),
+    TnGlassTopBuf: new Float64Array(glassNr),
+    hGlassSideBuf: new Float64Array(glassNz),
+    TnGlassSideBuf: new Float64Array(glassNz),
     Tstar: new Float64Array(Nr * Nz),
     hTopBuf: new Float64Array(Nr),
     TnTopBuf: new Float64Array(Nr),
@@ -636,7 +771,28 @@ export function step(state: SimState, substeps = 1) {
     TnSteakTopBuf,
     hSteakSideBuf,
     TnSteakSideBuf,
+    glassActive,
+    glassNr,
+    glassNz,
+    Tglass,
+    TglassStar,
+    dzGlass,
+    ringAreaGlass,
+    rGlassLeft,
+    rGlassRight,
+    drGlassFace,
+    kGlass,
+    rhoGlass,
+    cpGlassK,
+    epsGlass,
+    gGlassContact,
+    TnPanBotBuf,
+    hGlassTopBuf,
+    TnGlassTopBuf,
+    hGlassSideBuf,
+    TnGlassSideBuf,
   } = state;
+  const glassTopOff = glassActive ? (glassNz - 1) * glassNr : 0;
   const Tamb = params.ambient;
   const hConv = params.hConv;
   const heaterPower = params.heaterPower;
@@ -655,11 +811,12 @@ export function step(state: SimState, substeps = 1) {
   const windowSizeSec = Math.max(1e-3, params.steadyWindowSec);
 
   for (let s = 0; s < substeps; s++) {
-    // Hysteresis decision frozen for the whole step (T at its start). The
-    // sensed temperature is the top-surface cell directly above the heater
-    // ring (i = iHeater) — this is what physically reaches the setpoint and
-    // tracks the heater behaviour, not the geometric centre.
-    const Thyst = T2D[topRowOff + iHeater];
+    // Hysteresis decision frozen for the whole step (T at its start). For a
+    // plain flux heater the sensed temperature is the top-surface cell above
+    // the heater ring (i = iHeater) — what physically reaches the setpoint.
+    // For an induction heater the sensor sits at the centre of the glass
+    // plate's bottom face (k = 0, i = 0), emulating the cooktop's own probe.
+    const Thyst = glassActive ? Tglass[0] : T2D[topRowOff + iHeater];
     if (heaterOn && Thyst >= setHigh) heaterOn = false;
     else if (!heaterOn && Thyst <= setLow) heaterOn = true;
     const heaterFactor = heaterOn ? 1 : 0;
@@ -692,8 +849,7 @@ export function step(state: SimState, substeps = 1) {
     // Recapture flux density (W/m²) — uniform across the cooking surface.
     // π·panRadius² == Σ ringArea[0..nInner-1] (cell edges snap exactly).
     const aCooking = Math.PI * params.panRadius * params.panRadius;
-    const qBackPerArea =
-      aCooking > 0 ? (params.rimReturnFraction * P_rim_rad) / aCooking : 0;
+    const qBackPerArea = aCooking > 0 ? (params.rimReturnFraction * P_rim_rad) / aCooking : 0;
     // Bottom face of rim cells in the wide slab: at j = jBase. When
     // jBase === 0 this is the pan's actual bottom, matching the pre-base-plate
     // behaviour. When jBase > 0 this is the underside of the wide slab where
@@ -736,6 +892,34 @@ export function step(state: SimState, substeps = 1) {
       TnStemSideBuf.fill(Tamb);
     }
 
+    // ---- Induction glass: snapshot the pan bottom row (j = 0) and linearise
+    //      the glass's air-loss faces at T_n. The pan↔glass contact source is
+    //      explicit, built from these snapshots and applied with opposite sign
+    //      on each body in BOTH half-steps (total interface flux = dt·Q_n).
+    if (glassActive) {
+      for (let i = 0; i < Nr; i++) TnPanBotBuf[i] = T2D[i]; // j = 0 row
+      // Glass top face: air loss only beyond the pan footprint (i ≥ nInner);
+      // under the pan it is the contact face (handled as a source, no Robin).
+      for (let i = 0; i < glassNr; i++) {
+        const Tn = Tglass[glassTopOff + i];
+        TnGlassTopBuf[i] = Tn;
+        if (i >= nInner) {
+          const hRad = epsGlass * SIGMA * (Tn * Tn + Tamb * Tamb) * (Tn + Tamb);
+          hGlassTopBuf[i] = (hConv + hRad) * ringAreaGlass[i];
+        } else {
+          hGlassTopBuf[i] = 0;
+        }
+      }
+      // Glass outer side (i = glassNr-1) loses to air over the full thickness.
+      const glassSideArea = TWO_PI * rGlassRight[glassNr - 1] * dzGlass;
+      for (let kk = 0; kk < glassNz; kk++) {
+        const Tn = Tglass[kk * glassNr + (glassNr - 1)];
+        TnGlassSideBuf[kk] = Tn;
+        const hRad = epsGlass * SIGMA * (Tn * Tn + Tamb * Tamb) * (Tn + Tamb);
+        hGlassSideBuf[kk] = (hConv + hRad) * glassSideArea;
+      }
+    }
+
     // ---- Half-step 1: implicit in r, explicit in z (one tridiag per row j) ----
     for (let j = 0; j < Nz; j++) {
       const kj = k[j];
@@ -765,8 +949,7 @@ export function step(state: SimState, substeps = 1) {
         // Right neighbour is void when (i+1 ≥ nInner) ∧ (j < jBase). For
         // active cells in the stem this fires exactly at i = nInner − 1.
         const rightVoid = i < Nr - 1 ? i + 1 >= nInner && rowVoid : false;
-        const Gout =
-          i < Nr - 1 && !rightVoid ? (kj * TWO_PI * rRight[i] * dzj) / drFace[i + 1] : 0;
+        const Gout = i < Nr - 1 && !rightVoid ? (kj * TWO_PI * rRight[i] * dzj) / drFace[i + 1] : 0;
 
         tdSub[i] = -Gin;
         tdSup[i] = -Gout;
@@ -816,6 +999,12 @@ export function step(state: SimState, substeps = 1) {
         if (isBot) {
           if (heaterOn && heatedArea[i] > 0) {
             rhs += qDensity * heatedArea[i];
+          }
+          // Induction glass contact (cooking footprint, i < nInner): heat
+          // exchanged with the glass top below. Explicit source from the
+          // snapshotted T_n on both sides; coexists with the heater flux.
+          if (glassActive && i < nInner && gGlassContact[i] > 0) {
+            rhs += gGlassContact[i] * (Tglass[glassTopOff + i] - TnPanBotBuf[i]);
           }
         }
         // Wide-slab underside Robin for rim cells: applied at j = jBase
@@ -900,6 +1089,10 @@ export function step(state: SimState, substeps = 1) {
         }
         if (isBot) {
           if (heaterOn && heatedArea[i] > 0) rhs += qDensity * heatedArea[i];
+          // Induction glass contact (same explicit source as half-step 1).
+          if (glassActive && i < nInner && gGlassContact[i] > 0) {
+            rhs += gGlassContact[i] * (Tglass[glassTopOff + i] - TnPanBotBuf[i]);
+          }
         }
         if (j === jBase && hBotBuf[i] > 0) rhs += hBotBuf[i] * Tamb;
         // Stem outer-side Robin (radial face): explicit-r in this half.
@@ -1044,6 +1237,106 @@ export function step(state: SimState, substeps = 1) {
       }
     }
 
+    // ---- Induction glass ADI (only when active): half-step 1 implicit in r,
+    //      half-step 2 implicit in k. Bottom face (k = 0) is adiabatic. Top
+    //      face couples to the pan bottom via the SAME contact source the pan
+    //      saw, with opposite sign, for i < nInner; beyond the footprint it
+    //      loses to air. Outer side (i = glassNr-1) loses to air. The contact
+    //      and air sources are explicit (frozen at T_n) and applied identically
+    //      in both half-steps so the full-step interface flux is dt·Q_n.
+    if (glassActive && glassNr > 0 && glassNz > 0) {
+      const rcDzG = rhoGlass * cpGlassK * dzGlass;
+      const Gax = (kGlass * 1) / dzGlass; // axial conductance per unit area between glass cells
+      // Half-step 1: implicit-r, explicit-k (one tridiag per row k, size glassNr).
+      for (let kk = 0; kk < glassNz; kk++) {
+        const isTopG = kk === glassNz - 1;
+        for (let i = 0; i < glassNr; i++) {
+          const idx = kk * glassNr + i;
+          const A = ringAreaGlass[i];
+          const rhocV_dt2 = (rcDzG * A) / halfDt;
+          const Gin = i > 0 ? (kGlass * TWO_PI * rGlassLeft[i] * dzGlass) / drGlassFace[i] : 0;
+          const Gout =
+            i < glassNr - 1 ? (kGlass * TWO_PI * rGlassRight[i] * dzGlass) / drGlassFace[i + 1] : 0;
+
+          tdSub[i] = -Gin;
+          tdSup[i] = -Gout;
+          let diag = rhocV_dt2 + Gin + Gout;
+          // Outer-side air Robin (i = glassNr-1): on the diagonal in implicit-r.
+          if (i === glassNr - 1) diag += hGlassSideBuf[kk];
+          tdDiag[i] = diag;
+
+          let rhs = rhocV_dt2 * Tglass[idx];
+          // Axial (k-direction) conduction at T_n (explicit).
+          if (kk > 0) rhs += Gax * A * (Tglass[idx - glassNr] - Tglass[idx]);
+          if (kk < glassNz - 1) rhs += Gax * A * (Tglass[idx + glassNr] - Tglass[idx]);
+          // Top face (k = glassNz-1): contact source under the pan, else air.
+          if (isTopG) {
+            if (i < nInner && gGlassContact[i] > 0) {
+              rhs += gGlassContact[i] * (TnPanBotBuf[i] - TnGlassTopBuf[i]);
+            } else {
+              rhs -= hGlassTopBuf[i] * Tglass[idx];
+              rhs += hGlassTopBuf[i] * Tamb;
+            }
+          }
+          // Outer-side air Robin source.
+          if (i === glassNr - 1) rhs += hGlassSideBuf[kk] * Tamb;
+          // Bottom face (k = 0) is adiabatic — no term.
+          tdRhs[i] = rhs;
+        }
+        solveTridiag(tdSub, tdDiag, tdSup, tdRhs, tdSol, tdCprime, glassNr);
+        for (let i = 0; i < glassNr; i++) TglassStar[kk * glassNr + i] = tdSol[i];
+      }
+
+      // Half-step 2: implicit-k, explicit-r (one tridiag per column i, size glassNz).
+      for (let i = 0; i < glassNr; i++) {
+        const A = ringAreaGlass[i];
+        const Gin = i > 0 ? (kGlass * TWO_PI * rGlassLeft[i] * dzGlass) / drGlassFace[i] : 0;
+        const Gout =
+          i < glassNr - 1 ? (kGlass * TWO_PI * rGlassRight[i] * dzGlass) / drGlassFace[i + 1] : 0;
+        for (let kk = 0; kk < glassNz; kk++) {
+          const idx = kk * glassNr + i;
+          const rhocV_dt2 = (rcDzG * A) / halfDt;
+          const Gbot = kk > 0 ? Gax * A : 0;
+          const Gtop = kk < glassNz - 1 ? Gax * A : 0;
+          const isTopG = kk === glassNz - 1;
+
+          tdSub[kk] = -Gbot;
+          tdSup[kk] = -Gtop;
+          let diag = rhocV_dt2 + Gbot + Gtop;
+          // Top air Robin (only beyond the footprint) on the diagonal.
+          if (isTopG && !(i < nInner && gGlassContact[i] > 0)) diag += hGlassTopBuf[i];
+          tdDiag[kk] = diag;
+
+          let rhs = rhocV_dt2 * TglassStar[idx];
+          // Radial (i-direction) conduction at T* (explicit).
+          if (i > 0) rhs += Gin * (TglassStar[idx - 1] - TglassStar[idx]);
+          if (i < glassNr - 1) rhs += Gout * (TglassStar[idx + 1] - TglassStar[idx]);
+          // Top face source (same as half-step 1).
+          if (isTopG) {
+            if (i < nInner && gGlassContact[i] > 0) {
+              rhs += gGlassContact[i] * (TnPanBotBuf[i] - TnGlassTopBuf[i]);
+            } else {
+              rhs += hGlassTopBuf[i] * Tamb;
+            }
+          }
+          // Outer-side Robin in this half is explicit-r → RHS.
+          if (i === glassNr - 1) {
+            rhs -= hGlassSideBuf[kk] * TglassStar[idx];
+            rhs += hGlassSideBuf[kk] * Tamb;
+          }
+          tdRhs[kk] = rhs;
+        }
+        solveTridiag(tdSub, tdDiag, tdSup, tdRhs, tdSol, tdCprime, glassNz);
+        for (let kk = 0; kk < glassNz; kk++) {
+          const idx = kk * glassNr + i;
+          const diff = tdSol[kk] - Tglass[idx];
+          const ad = diff < 0 ? -diff : diff;
+          if (ad > maxDeltaT) maxDeltaT = ad;
+          Tglass[idx] = tdSol[kk];
+        }
+      }
+    }
+
     // ---- Energy tally (trapezoidal — exact for the applied flux) ----
     // Top face loss for pan cells NOT covered by the steak. When the top row
     // is itself a base-plate row (jBase === Nz), rim cells are void and have
@@ -1113,6 +1406,29 @@ export function step(state: SimState, substeps = 1) {
         const hRad = (hSteakSideBuf[kk] - hConv * sideArea) / sideArea;
         eLossConv += hConv * dTavg * sideArea * dt;
         eLossRad += hRad * dTavg * sideArea * dt;
+      }
+    }
+    // Induction glass air-loss tally (top face beyond the footprint + outer
+    // side). The bottom face is adiabatic and the contact face is internal, so
+    // neither contributes to the ambient loss bookkeeping.
+    if (glassActive && glassNr > 0 && glassNz > 0) {
+      for (let i = nInner; i < glassNr; i++) {
+        const Tn = TnGlassTopBuf[i];
+        const Tnp1 = Tglass[glassTopOff + i];
+        const dTavg = 0.5 * (Tn + Tnp1) - Tamb;
+        const A = ringAreaGlass[i];
+        const hRad = (hGlassTopBuf[i] - hConv * A) / A;
+        eLossConv += hConv * dTavg * A * dt;
+        eLossRad += hRad * dTavg * A * dt;
+      }
+      const glassSideArea = TWO_PI * rGlassRight[glassNr - 1] * dzGlass;
+      for (let kk = 0; kk < glassNz; kk++) {
+        const Tn = TnGlassSideBuf[kk];
+        const Tnp1 = Tglass[kk * glassNr + (glassNr - 1)];
+        const dTavg = 0.5 * (Tn + Tnp1) - Tamb;
+        const hRad = (hGlassSideBuf[kk] - hConv * glassSideArea) / glassSideArea;
+        eLossConv += hConv * dTavg * glassSideArea * dt;
+        eLossRad += hRad * dTavg * glassSideArea * dt;
       }
     }
 
@@ -1262,6 +1578,18 @@ export function step(state: SimState, substeps = 1) {
       eStored += rcDzS * rowSum;
     }
   }
+  if (glassActive && glassNr > 0 && glassNz > 0) {
+    const T0g = state.glassInitialTempK;
+    const rcDzG = rhoGlass * cpGlassK * dzGlass;
+    for (let kk = 0; kk < glassNz; kk++) {
+      let rowSum = 0;
+      const rowOff = kk * glassNr;
+      for (let i = 0; i < glassNr; i++) {
+        rowSum += ringAreaGlass[i] * (Tglass[rowOff + i] - T0g);
+      }
+      eStored += rcDzG * rowSum;
+    }
+  }
 
   // Top-surface temperature stats at the new time. T_max scans only the cooking
   // zone (i < nInner); T_edge is the single cell at the cooking-zone outer edge
@@ -1361,4 +1689,6 @@ export const MATERIALS: Record<string, Material> = {
   Copper: { k: 400, rho: 8960, cp: 385, emissivity: 0.05 },
   Titanium: { k: 22, rho: 4500, cp: 520, emissivity: 0.2 },
   Ceramic: { k: 2, rho: 2300, cp: 800, emissivity: 0.9 },
+  // Glass-ceramic cooktop plate (e.g. Schott Ceran). Low conductivity, dense.
+  Glass: { k: 2, rho: 2600, cp: 800, emissivity: 0.9 },
 };

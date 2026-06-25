@@ -14,6 +14,7 @@ import { MATERIALS, type Layer } from "@/lib/simulation";
 import {
   type PanConfig,
   type HeaterConfig,
+  type HeaterType,
   PAN_TEMPLATES,
   HEATER_TEMPLATES,
   uid,
@@ -400,6 +401,21 @@ export function HeaterEditor({
               <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => remove(h.id)}>
                 <Trash2 className="w-3 h-3" />
               </Button>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">Type</Label>
+              <Select
+                value={h.type ?? "flux"}
+                onValueChange={(v) => update(h.id, { type: v as HeaterType })}
+              >
+                <SelectTrigger className="h-8 text-xs w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="flux">Flux (gas / electric)</SelectItem>
+                  <SelectItem value="induction">Induction (glass plate)</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <Field
               label="Ring mean diameter (cm)"

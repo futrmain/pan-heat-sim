@@ -15,6 +15,12 @@ export interface PanConfig {
   rimReturnFraction?: number;
 }
 
+// Heater type discriminator. "flux" (default) is the simple bottom-surface
+// heat-flux model used by gas and electric heaters. "induction" additionally
+// models the cooktop's glass-ceramic plate beneath the pan and drives the
+// hysteresis off a sensor on the glass bottom face (see simulation.ts).
+export type HeaterType = "flux" | "induction";
+
 export interface HeaterConfig {
   id: string;
   name: string;
@@ -23,6 +29,9 @@ export interface HeaterConfig {
   power: number; // W
   setpointHigh: number; // °C — heater turns off when center top-surface T ≥ this
   setpointLow: number; // °C — heater turns on when center top-surface T ≤ this
+  // Optional for backward compatibility with old saved heaters (defaults to
+  // "flux"). Only "induction" enables the glass-plate model.
+  type?: HeaterType;
 }
 
 const L = (name: string, thickness: number, basePlate?: boolean): Layer => ({
@@ -119,6 +128,7 @@ export const HEATER_TEMPLATES: HeaterConfig[] = [
     power: 2200,
     setpointHigh: 300,
     setpointLow: 280,
+    type: "induction",
   },
   {
     id: "tpl-electric-coil",
